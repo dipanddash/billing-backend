@@ -95,6 +95,11 @@ class PurchaseItem(models.Model):
 
     quantity = models.DecimalField(max_digits=12, decimal_places=3)
 
+    unit_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2
+    )
+
 
 
 class ManualClosing(models.Model):

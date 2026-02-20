@@ -1,13 +1,22 @@
 from django.urls import path
 from .views import (
-    CategoryListView,
-    ProductListView,
-    RecipeListView
+    CategoryListCreateView,
+    ProductListCreateView,
+    ProductUpdateView,
+    RecipeListCreateView,
+    RecipeUpdateDeleteView,
 )
 
 urlpatterns = [
 
-    path("categories/", CategoryListView.as_view()),
-    path("products/", ProductListView.as_view()),
-    path("recipes/", RecipeListView.as_view()),
+    path(
+        "categories/",
+        CategoryListCreateView.as_view(),
+        name="category-list-create"
+    ),
+    path("products/", ProductListCreateView.as_view()),
+    path("recipes/", RecipeListCreateView.as_view()),
+    path("products/<uuid:pk>/", ProductUpdateView.as_view()),
+    path("recipes/<int:pk>/", RecipeUpdateDeleteView.as_view()),
+
 ]

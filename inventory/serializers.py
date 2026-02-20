@@ -1,6 +1,18 @@
 from rest_framework import serializers
-from .models import Ingredient, PurchaseItem, StockLog, Vendor, PurchaseInvoice
+from django.db import transaction
 
+from .models import (
+    Ingredient,
+    PurchaseItem,
+    StockLog,
+    Vendor,
+    PurchaseInvoice
+)
+
+
+# -----------------------
+# INGREDIENT
+# -----------------------
 
 class IngredientSerializer(serializers.ModelSerializer):
 
@@ -8,17 +20,36 @@ class IngredientSerializer(serializers.ModelSerializer):
         model = Ingredient
         fields = "__all__"
 
+
+# -----------------------
+# VENDOR
+# -----------------------
+
 class VendorSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Vendor
         fields = "__all__"
 
+
+# -----------------------
+# PURCHASE ITEM
+# -----------------------
+
 class PurchaseItemSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = PurchaseItem
-        fields = ["ingredient", "quantity"]
+        fields = [
+            "ingredient",
+            "quantity",
+            "unit_price"
+        ]
+
+
+# -----------------------
+# PURCHASE INVOICE
+# -----------------------
 
 class PurchaseInvoiceSerializer(serializers.ModelSerializer):
 
@@ -26,52 +57,78 @@ class PurchaseInvoiceSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = PurchaseInvoice
-        fields = ["id", "vendor", "invoice_number", "items", "created_at"]
-        read_only_fields = ["id", "created_at"]
+        fields = [
+            "id",
+            "vendor",
+            "invoice_number",
+            "items",
+            "created_at"
+        ]
+
+        read_only_fields = [
+            "id",
+            "created_at"
+        ]
+
 
     def create(self, validated_data):
 
         items_data = validated_data.pop("items")
 
-        request = self.context["request"]
+        # ✅ GET USER SAFELY
+        request = self.context.get("request")
+
         user = (
-    request.user
-    if request and request.user.is_authenticated
-    else None
-)
+            request.user
+            if request and request.user.is_authenticated
+            else None
+        )
 
-
-        from django.db import transaction
 
         with transaction.atomic():
 
+            # -----------------------
+            # CREATE INVOICE
+            # -----------------------
+
             invoice = PurchaseInvoice.objects.create(
-                purchased_by=user,
+                purchased_by=user,   # 🔥 SAVE STAFF NAME
                 **validated_data
             )
+
+
+            # -----------------------
+            # CREATE ITEMS + UPDATE STOCK
+            # -----------------------
 
             for item in items_data:
 
                 ingredient = item["ingredient"]
                 qty = item["quantity"]
+                price = item["unit_price"]
 
-                # Create item
+
+                # Create purchase item
                 PurchaseItem.objects.create(
                     invoice=invoice,
                     ingredient=ingredient,
-                    quantity=qty
+                    quantity=qty,
+                    unit_price=price
                 )
+
 
                 # Update stock
                 ingredient.current_stock += qty
                 ingredient.save()
 
-                # Log
+
+                # Stock log
                 StockLog.objects.create(
                     ingredient=ingredient,
                     change=qty,
                     reason="PURCHASE",
                     user=user
                 )
+
 
         return invoice

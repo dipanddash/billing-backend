@@ -3,6 +3,8 @@ from rest_framework import generics
 from django.utils import timezone
 import random
 from rest_framework.exceptions import ValidationError
+
+from accounts.permissions import IsAdminOrStaff
 from .models import Table, TableSession
 from .serializers import TableSerializer, TableSessionSerializer
 
@@ -10,12 +12,20 @@ class TableListView(generics.ListAPIView):
 
     queryset = Table.objects.all().order_by("number")
     serializer_class = TableSerializer
+    permission_classes = [IsAdminOrStaff]
+
+class TableCreateView(generics.CreateAPIView):
+
+    queryset = Table.objects.all()
+    serializer_class = TableSerializer
+    permission_classes = [IsAdminOrStaff]
 
 
 class TableSessionCreateView(generics.CreateAPIView):
 
     queryset = TableSession.objects.all()
     serializer_class = TableSessionSerializer
+    permission_classes = [IsAdminOrStaff]
 
     def perform_create(self, serializer):
 
@@ -46,9 +56,17 @@ class TableSessionCreateView(generics.CreateAPIView):
 class ActiveSessionListView(generics.ListAPIView):
 
     serializer_class = TableSessionSerializer
+    permission_classes = [IsAdminOrStaff]
 
     def get_queryset(self):
 
-        return TableSession.objects.filter(
-            is_active=True
-        ).select_related("table")
+        table_id = self.kwargs.get("table_id")
+
+        qs = TableSession.objects.filter(is_active=True)
+
+        if table_id:
+            qs = qs.filter(table_id=table_id)
+
+        return qs.select_related("table")
+
+
