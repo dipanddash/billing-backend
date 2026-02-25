@@ -5,6 +5,7 @@ from .views import (
     IngredientUpdateDeleteView,
     VendorListCreateView,
     VendorDetailView,
+    VendorHistoryView,
     PurchaseInvoiceCreateView
 )
 
@@ -18,6 +19,7 @@ urlpatterns = [
     # VENDOR
     path("vendors/", VendorListCreateView.as_view()),
     path("vendors/<uuid:pk>/", VendorDetailView.as_view()),
+    path("vendors/<uuid:pk>/history/", VendorHistoryView.as_view()),
     path("purchase-invoices/", PurchaseInvoiceCreateView.as_view()),
 
 ]

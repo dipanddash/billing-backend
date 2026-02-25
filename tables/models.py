@@ -32,6 +32,7 @@ class TableSession(models.Model):
     customer_name = models.CharField(max_length=150)
 
     customer_phone = models.CharField(max_length=20)
+    guest_count = models.PositiveIntegerField(default=1)
 
     is_active = models.BooleanField(default=True)
 

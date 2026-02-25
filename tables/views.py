@@ -1,6 +1,7 @@
 import token
 from rest_framework import generics
 from django.utils import timezone
+from django.db.models import Prefetch
 import random
 from rest_framework.exceptions import ValidationError
 
@@ -10,7 +11,26 @@ from .serializers import TableSerializer, TableSessionSerializer
 
 class TableListView(generics.ListAPIView):
 
-    queryset = Table.objects.all().order_by("number")
+    queryset = (
+        Table.objects
+        .all()
+        .order_by("number")
+        .prefetch_related(
+            Prefetch(
+                "sessions",
+                queryset=(
+                    TableSession.objects
+                    .filter(
+                        is_active=True,
+                        closed_at__isnull=True,
+                        table__status="OCCUPIED",
+                    )
+                    .order_by("-created_at")
+                ),
+                to_attr="active_sessions",
+            )
+        )
+    )
     serializer_class = TableSerializer
     permission_classes = [IsAdminOrStaff]
 
@@ -62,7 +82,11 @@ class ActiveSessionListView(generics.ListAPIView):
 
         table_id = self.kwargs.get("table_id")
 
-        qs = TableSession.objects.filter(is_active=True)
+        qs = TableSession.objects.filter(
+            is_active=True,
+            closed_at__isnull=True,
+            table__status="OCCUPIED",
+        )
 
         if table_id:
             qs = qs.filter(table_id=table_id)

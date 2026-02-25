@@ -10,7 +10,7 @@ from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
 
 from accounts.models import Customer
-from accounts.permissions import IsAdminOrStaff
+from accounts.permissions import IsAdminOrStaff, IsAdminRole
 from payments.models import Payment
 from inventory.models import StockLog
 from products.models import Product, Recipe
@@ -25,6 +25,46 @@ from .serializers import (
     OrderDetailSerializer
 )
 from .utils import send_whatsapp_invoice
+
+
+def apply_order_filters(request, queryset):
+    """
+    Supported query params:
+    - filter=pending|cancelled|paid|finished
+    - status=NEW,IN_PROGRESS,...
+    - payment_status=UNPAID,PAID,REFUNDED
+    """
+    filter_key = (request.GET.get("filter") or "").strip().lower()
+    status_param = (request.GET.get("status") or "").strip()
+    payment_param = (request.GET.get("payment_status") or "").strip()
+
+    if filter_key == "pending":
+        queryset = queryset.exclude(status__in=["CANCELLED", "COMPLETED"]).filter(payment_status="UNPAID")
+    elif filter_key == "cancelled":
+        queryset = queryset.filter(status="CANCELLED")
+    elif filter_key == "paid":
+        queryset = queryset.filter(payment_status="PAID")
+    elif filter_key == "finished":
+        queryset = queryset.filter(status="COMPLETED")
+
+    if status_param:
+        statuses = [s.strip() for s in status_param.split(",") if s.strip()]
+        if statuses:
+            queryset = queryset.filter(status__in=statuses)
+
+    if payment_param:
+        payments = [p.strip() for p in payment_param.split(",") if p.strip()]
+        if payments:
+            queryset = queryset.filter(payment_status__in=payments)
+
+    return queryset
+
+
+def error_response(message, status_code, extra=None):
+    payload = {"error": message, "detail": message}
+    if extra:
+        payload.update(extra)
+    return Response(payload, status=status_code)
 
 # =====================================
 # CREATE ORDER (GENERIC)
@@ -49,24 +89,104 @@ class TodayOrderListView(generics.ListAPIView):
 
         today = timezone.now().date()
 
-        return (
+        qs = (
             Order.objects
             .filter(created_at__date=today)
-            .exclude(status="CANCELLED")
             .select_related("table", "session", "customer")
             .prefetch_related("items__product")
             .order_by("created_at")
         )
+
+        has_explicit_filter = any([
+            request_key in self.request.GET
+            for request_key in ["filter", "status", "payment_status"]
+        ])
+        if not has_explicit_filter:
+            qs = qs.exclude(status="CANCELLED")
+
+        return apply_order_filters(self.request, qs)
 
 
 # =====================================
 # UPDATE STATUS
 # =====================================
 
-class OrderStatusUpdateView(generics.UpdateAPIView):
-    queryset = Order.objects.all()
-    serializer_class = OrderStatusSerializer
+class OrderStatusUpdateView(APIView):
     permission_classes = [IsAdminOrStaff]
+
+    def patch(self, request, pk):
+        try:
+            order = Order.objects.get(pk=pk)
+        except Order.DoesNotExist:
+            return error_response("Order not found", 404)
+
+        next_status = (request.data.get("status") or "").strip().upper()
+        if not next_status:
+            return error_response("status is required", 400)
+
+        valid_statuses = {choice[0] for choice in Order.STATUS_CHOICES}
+        if next_status not in valid_statuses:
+            return error_response(
+                "Invalid status value",
+                400,
+                {"allowed_statuses": sorted(valid_statuses)},
+            )
+
+        order.status = next_status
+        order.save(update_fields=["status"])
+        return Response({"id": str(order.id), "status": order.status}, status=200)
+
+
+class OrderCancelView(APIView):
+
+    permission_classes = [IsAdminRole]
+
+    def post(self, request, pk):
+
+        try:
+            order = (
+                Order.objects
+                .select_related("session", "table")
+                .get(pk=pk)
+            )
+        except Order.DoesNotExist:
+            return Response({"error": "Order not found"}, status=404)
+
+        if order.status == "CANCELLED":
+            return Response({"error": "Order already cancelled"}, status=400)
+
+        if order.payment_status == "PAID" or order.status == "COMPLETED":
+            return Response(
+                {"error": "Paid/completed orders cannot be cancelled"},
+                status=400
+            )
+
+        with transaction.atomic():
+            order.status = "CANCELLED"
+            order.save(update_fields=["status"])
+
+            # If this is the last non-cancelled order in session, close session and free table.
+            if order.session and order.session.is_active:
+                has_open_orders = (
+                    order.session.orders
+                    .exclude(pk=order.pk)
+                    .exclude(status="CANCELLED")
+                    .exists()
+                )
+
+                if not has_open_orders:
+                    order.session.is_active = False
+                    order.session.closed_at = timezone.now()
+                    order.session.save(update_fields=["is_active", "closed_at"])
+
+                    if order.session.table:
+                        order.session.table.status = "AVAILABLE"
+                        order.session.table.save(update_fields=["status"])
+
+        return Response(
+            {"id": str(order.id), "status": order.status, "message": "Order cancelled"},
+            status=200
+        )
 
 
 # =====================================
@@ -154,15 +274,18 @@ class OrderPaymentView(APIView):
                 Order.objects
                 .filter(bill_number__isnull=False)
                 .order_by("-created_at")
-                .first()
+                .all()
             )
 
-            if last_order and last_order.bill_number:
-                next_number = int(last_order.bill_number) + 1
-            else:
-                next_number = 1
+            next_number = 1
+            for prev_order in last_order:
+                try:
+                    next_number = int(prev_order.bill_number) + 1
+                    break
+                except (TypeError, ValueError):
+                    continue
 
-            bill_no = f"{next_number:012d}"
+            bill_no = f"{next_number:04d}"
 
             # -------------------------
             # Update Order
@@ -320,33 +443,51 @@ class AddOrderItemsView(APIView):
             order = Order.objects.get(id=order_id)
 
         except Order.DoesNotExist:
-            return Response(
-                {"error": "Order not found"},
-                status=404
-            )
+            return error_response("Order not found", 404)
 
         items = request.data.get("items", [])
 
         if not items:
-            return Response(
-                {"error": "No items provided"},
-                status=400
-            )
+            return error_response("No items provided", 400)
 
         # Remove old items
         order.items.all().delete()
 
         total = Decimal("0.00")
 
-        for item in items:
+        for idx, item in enumerate(items):
 
             product_id = item.get("product")
-            qty = int(item.get("quantity"))
+            if not product_id:
+                return error_response(
+                    "Product id is required",
+                    400,
+                    {"item_index": idx},
+                )
+
+            try:
+                qty = int(item.get("quantity"))
+            except (TypeError, ValueError):
+                return error_response(
+                    "Quantity must be a valid integer",
+                    400,
+                    {"item_index": idx},
+                )
+            if qty <= 0:
+                return error_response(
+                    "Quantity must be greater than 0",
+                    400,
+                    {"item_index": idx},
+                )
 
             try:
                 product = Product.objects.get(id=product_id)
             except Product.DoesNotExist:
-                continue
+                return error_response(
+                    "Invalid product id",
+                    400,
+                    {"item_index": idx, "product": str(product_id)},
+                )
 
             base_price = product.price
             gst_percent = product.gst_percent or Decimal("0.00")
@@ -393,7 +534,10 @@ class OrderCreateView(APIView):
 
     def post(self, request):
 
-        order_type = request.data.get("order_type", "DINE_IN")
+        raw_order_type = request.data.get("order_type", "DINE_IN")
+        order_type = (raw_order_type or "DINE_IN").strip().upper()
+        if order_type == "TAKE_AWAY":
+            order_type = "TAKEAWAY"
 
         table_id = request.data.get("table")
         session_id = request.data.get("session")
@@ -410,18 +554,12 @@ class OrderCreateView(APIView):
         if order_type == "DINE_IN":
 
             if not session_id:
-                return Response(
-                    {"error": "Session required for dine-in"},
-                    status=400
-                )
+                return error_response("Session required for dine-in", 400)
 
             try:
                 session = TableSession.objects.get(id=session_id)
             except TableSession.DoesNotExist:
-                return Response(
-                    {"error": "Invalid session"},
-                    status=400
-                )
+                return error_response("Invalid session", 400)
 
             # Get / Create customer from session
             if session.customer_phone:
@@ -459,20 +597,24 @@ class OrderCreateView(APIView):
             )
 
         else:
-            return Response(
-                {"error": "Invalid order type"},
-                status=400
-            )
+            return error_response("Invalid order type", 400)
 
 
         # -------------------------
         # CREATE ORDER
         # -------------------------
+        resolved_table_id = None
+        if order_type == "DINE_IN":
+            if session and session.table_id:
+                resolved_table_id = session.table_id
+            else:
+                resolved_table_id = table_id
+
         order = Order.objects.create(
 
             order_type=order_type,
 
-            table_id=table_id if order_type == "DINE_IN" else None,
+            table_id=resolved_table_id if order_type == "DINE_IN" else None,
 
             session=session if order_type == "DINE_IN" else None,
 
@@ -486,7 +628,10 @@ class OrderCreateView(APIView):
         )
 
         return Response(
-            {"id": order.id},
+            {
+                "id": order.id,
+                "order_id": f"{order.order_number:03d}" if order.order_number is not None else None
+            },
             status=201
         )
 
@@ -497,12 +642,62 @@ class OrderListView(generics.ListAPIView):
 
     def get_queryset(self):
 
-        return (
+        qs = (
             Order.objects
             .select_related("table", "customer")
             .prefetch_related("items")
             .order_by("-created_at")
         )
+        return apply_order_filters(self.request, qs)
+
+
+class RecentOrderListView(APIView):
+
+    permission_classes = [IsAdminOrStaff]
+
+    def get(self, request):
+
+        try:
+            limit = int(request.GET.get("limit", 10))
+        except (TypeError, ValueError):
+            limit = 10
+
+        limit = max(1, min(limit, 100))
+
+        qs = (
+            Order.objects
+            .select_related("table", "customer")
+            .prefetch_related("items")
+            .order_by("-created_at")
+        )
+
+        if request.user.role == "STAFF":
+            qs = qs.filter(staff=request.user)
+
+        qs = apply_order_filters(request, qs)
+        orders = qs[:limit]
+
+        data = []
+        for order in orders:
+            customer_name = order.customer_name
+            if not customer_name and order.customer:
+                customer_name = order.customer.name
+
+            data.append({
+                "id": str(order.id),
+                "order_id": f"{order.order_number:03d}" if order.order_number is not None else None,
+                "bill_number": order.bill_number,
+                "customer_name": customer_name,
+                "table_name": order.table.number if order.table else None,
+                "items_count": order.items.count(),
+                "total_amount": order.total_amount,
+                "order_type": order.order_type,
+                "status": order.status,
+                "payment_status": order.payment_status,
+                "created_at": order.created_at
+            })
+
+        return Response(data)
 
 
 class SendWhatsAppInvoiceView(APIView):

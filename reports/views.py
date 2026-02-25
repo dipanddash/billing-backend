@@ -1,538 +1,758 @@
-from urllib import request
-from rest_framework.views import APIView
-from rest_framework.response import Response
-
-from django.db.models import Sum, F
-from django.utils.dateparse import parse_date
-
-from accounts.permissions import IsAdminOrStaff, IsAdminRole
-from orders.models import Order
-from orders.models import OrderItem
-from payments.models import Payment
-from inventory.models import Ingredient
-from inventory.models import PurchaseInvoice
-from django.db.models import Sum, F, DecimalField
-from django.db.models.functions import Coalesce
-from inventory.models import PurchaseItem
-from inventory.models import StockLog
+from datetime import timedelta
 from decimal import Decimal
-from django.db.models.functions import ExtractHour
-from django.db.models import Count
+
+from django.db.models import Count, DecimalField, F, OuterRef, Subquery, Sum, Value
+from django.db.models.functions import Coalesce, ExtractHour, TruncDate
+from django.utils import timezone
+from django.utils.dateparse import parse_date
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from accounts.models import User, StaffSessionLog
+from accounts.permissions import IsAdminOrStaff, IsAdminRole
+from inventory.models import Ingredient, PurchaseInvoice, PurchaseItem, StockLog
+from orders.models import Order, OrderItem
+from payments.models import Payment
+from products.models import Product
+
+
+def _as_date(value):
+    if not value:
+        return None
+    return parse_date(value)
+
 
 class DailySalesReportView(APIView):
     permission_classes = [IsAdminOrStaff]
-    
 
     def get(self, request):
+        period = (request.GET.get("period") or "").strip().lower()
+        date_param = _as_date(request.GET.get("date"))
 
-        date = request.GET.get("date")
+        if date_param:
+            start_date = end_date = date_param
+        elif period in ["weekly", "monthly"]:
+            days = 7 if period == "weekly" else 30
+            end_date = timezone.localdate()
+            start_date = end_date - timedelta(days=days - 1)
+        else:
+            start_date = end_date = timezone.localdate()
 
-        if not date:
-            return Response(
-                {"error": "date is required (YYYY-MM-DD)"},
-                status=400
-            )
-
-        date = parse_date(date)
-
-        total = Order.objects.filter( 
+        qs = Order.objects.filter(
             status="COMPLETED",
-            created_at__date=date
+            created_at__date__range=[start_date, end_date],
         )
-        
         if request.user.role == "STAFF":
-            total = total.filter(staff=request.user)
-        
-        total = total.aggregate(
-            total=Sum("total_amount")
-        )["total"] or 0
+            qs = qs.filter(staff=request.user)
 
-        count = Order.objects.filter(
-            status="COMPLETED",
-            created_at__date=date
-        ).count()
+        day_map = {
+            row["created_date"]: row
+            for row in qs.annotate(created_date=TruncDate("created_at"))
+            .values("created_date")
+            .annotate(
+                sales=Coalesce(
+                    Sum("total_amount"),
+                    Decimal("0.00"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                ),
+                orders=Count("id"),
+            )
+        }
 
-        return Response({
-            "date": str(date),
-            "total_sales": total,
-            "total_orders": count
-        })
+        data = []
+        day = start_date
+        while day <= end_date:
+            row = day_map.get(day)
+            data.append(
+                {
+                    "date": str(day),
+                    "sales": row["sales"] if row else Decimal("0.00"),
+                    "orders": row["orders"] if row else 0,
+                }
+            )
+            day += timedelta(days=1)
+
+        return Response(data)
 
 
 class ProductSalesReportView(APIView):
     permission_classes = [IsAdminRole]
 
     def get(self, request):
+        start = _as_date(request.GET.get("start"))
+        end = _as_date(request.GET.get("end"))
 
-        start = request.GET.get("start")
-        end = request.GET.get("end")
+        qs = OrderItem.objects.filter(order__status="COMPLETED", product__isnull=False)
+        if start and end:
+            qs = qs.filter(order__created_at__date__range=[start, end])
 
-        qs = OrderItem.objects.filter(
-            order__status="COMPLETED"
+        rows = (
+            qs.values("product__name")
+            .annotate(
+                qty=Coalesce(Sum("quantity"), 0),
+                sales=Coalesce(
+                    Sum(
+                        F("quantity") * F("price_at_time"),
+                        output_field=DecimalField(max_digits=12, decimal_places=2),
+                    ),
+                    Decimal("0.00"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                ),
+            )
+            .order_by("-qty")
         )
 
+        return Response([{"product": r["product__name"], "qty": r["qty"], "sales": r["sales"]} for r in rows])
+
+
+class CategorySalesReportView(APIView):
+    permission_classes = [IsAdminOrStaff]
+
+    def get(self, request):
+        start = _as_date(request.GET.get("start"))
+        end = _as_date(request.GET.get("end"))
+        limit = max(1, min(int(request.GET.get("limit", 50)), 100))
+
+        qs = OrderItem.objects.filter(order__status="COMPLETED", product__isnull=False)
+        if request.user.role == "STAFF":
+            qs = qs.filter(order__staff=request.user)
         if start and end:
-            qs = qs.filter(
-                order__created_at__date__range=[start, end]
-            )
+            qs = qs.filter(order__created_at__date__range=[start, end])
 
-        data = qs.values(
-            "product__name"
-        ).annotate(
-            total_qty=Sum("quantity"),
-            total_amount=Sum(
-                F("quantity") * F("price_at_time")
+        rows = (
+            qs.values("product__category__name")
+            .annotate(
+                sales=Coalesce(
+                    Sum(
+                        F("quantity") * F("price_at_time"),
+                        output_field=DecimalField(max_digits=12, decimal_places=2),
+                    ),
+                    Decimal("0.00"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                ),
+                orders=Count("order", distinct=True),
             )
-        ).order_by("-total_qty")
+            .order_by("-sales")[:limit]
+        )
 
-        return Response(data)
+        return Response(
+            [
+                {"category": r["product__category__name"] or "Other", "sales": r["sales"], "orders": r["orders"]}
+                for r in rows
+            ]
+        )
+
+
+class TopDishesReportView(APIView):
+    permission_classes = [IsAdminOrStaff]
+
+    def get(self, request):
+        start = _as_date(request.GET.get("start"))
+        end = _as_date(request.GET.get("end"))
+        limit = max(1, min(int(request.GET.get("limit", 20)), 100))
+
+        qs = OrderItem.objects.filter(order__status="COMPLETED", product__isnull=False)
+        if request.user.role == "STAFF":
+            qs = qs.filter(order__staff=request.user)
+        if start and end:
+            qs = qs.filter(order__created_at__date__range=[start, end])
+
+        rows = (
+            qs.values("product_id", "product__name")
+            .annotate(
+                qty=Coalesce(Sum("quantity"), 0),
+                sales=Coalesce(
+                    Sum(
+                        F("quantity") * F("price_at_time"),
+                        output_field=DecimalField(max_digits=12, decimal_places=2),
+                    ),
+                    Decimal("0.00"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                ),
+            )
+            .order_by("-qty")[:limit]
+        )
+
+        product_ids = [r["product_id"] for r in rows if r.get("product_id")]
+        products_by_id = Product.objects.filter(id__in=product_ids).only("id", "image")
+        image_map = {
+            product.id: request.build_absolute_uri(product.image.url)
+            if getattr(product, "image", None)
+            else None
+            for product in products_by_id
+        }
+
+        return Response(
+            [
+                {
+                    "dish": r["product__name"],
+                    "qty": r["qty"],
+                    "sales": r["sales"],
+                    "image_url": image_map.get(r["product_id"]),
+                }
+                for r in rows
+            ]
+        )
+
 
 class PaymentMethodReportView(APIView):
     permission_classes = [IsAdminRole]
 
     def get(self, request):
+        start = _as_date(request.GET.get("start"))
+        end = _as_date(request.GET.get("end"))
 
-        start = request.GET.get("start")
-        end = request.GET.get("end")
-
-        qs = Payment.objects.filter(
-            status="SUCCESS"
-        )
-
+        qs = Payment.objects.filter(status="SUCCESS")
         if start and end:
-            qs = qs.filter(
-                paid_at__date__range=[start, end]
-            )
+            qs = qs.filter(paid_at__date__range=[start, end])
 
-        data = qs.values("method").annotate(
-            total=Sum("amount"),
-            count=Sum(1)
+        rows = qs.values("method").annotate(
+            transactions=Count("id"),
+            amount=Coalesce(
+                Sum("amount"),
+                Decimal("0.00"),
+                output_field=DecimalField(max_digits=12, decimal_places=2),
+            ),
         )
+        return Response([{"method": r["method"], "transactions": r["transactions"], "amount": r["amount"]} for r in rows])
 
-        return Response(data)
 
 class CurrentStockReportView(APIView):
     permission_classes = [IsAdminOrStaff]
 
     def get(self, request):
+        latest_price_subquery = (
+            PurchaseItem.objects.filter(ingredient=OuterRef("pk"))
+            .order_by("-invoice__created_at")
+            .values("unit_price")[:1]
+        )
 
-        data = Ingredient.objects.values(
-            "name",
-            "unit",
-            "current_stock",
-            "min_stock"
+        rows = Ingredient.objects.annotate(
+            latest_unit_price=Coalesce(
+                Subquery(latest_price_subquery, output_field=DecimalField(max_digits=12, decimal_places=2)),
+                Value(Decimal("0.00")),
+                output_field=DecimalField(max_digits=12, decimal_places=2),
+            )
         ).order_by("name")
 
+        data = []
+        for item in rows:
+            stock_value = item.current_stock * item.latest_unit_price
+            data.append(
+                {
+                    "item": item.name,
+                    "stock_qty": item.current_stock,
+                    "unit": item.unit,
+                    "stock_value": stock_value,
+                }
+            )
         return Response(data)
-
-
 
 
 class PurchaseReportView(APIView):
     permission_classes = [IsAdminOrStaff]
 
     def get(self, request):
+        date_param = _as_date(request.GET.get("date"))
+        start = _as_date(request.GET.get("start"))
+        end = _as_date(request.GET.get("end"))
 
-        date = request.GET.get("date")
+        qs = PurchaseInvoice.objects.all()
+        if date_param:
+            qs = qs.filter(created_at__date=date_param)
+        elif start and end:
+            qs = qs.filter(created_at__date__range=[start, end])
 
-        qs = PurchaseInvoice.objects.all().select_related("vendor")
-
-        if date:
-            date = parse_date(date)
-            qs = qs.filter(created_at__date=date)
-
-        data = qs.annotate(
-
-            total_amount=Coalesce(
-                Sum(
-                    F("items__quantity") * F("items__unit_price"),
-                    output_field=DecimalField(max_digits=12, decimal_places=2)
+        rows = (
+            qs.annotate(day=TruncDate("created_at"))
+            .values("day")
+            .annotate(
+                purchase=Coalesce(
+                    Sum(
+                        F("items__quantity") * F("items__unit_price"),
+                        output_field=DecimalField(max_digits=12, decimal_places=2),
+                    ),
+                    Decimal("0.00"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
                 ),
-                0,
-                output_field=DecimalField(max_digits=12, decimal_places=2)
+                vendors=Count("vendor", distinct=True),
             )
+            .order_by("day")
+        )
 
-        ).values(
-            "invoice_number",
-            "vendor__name",
-            "total_amount",
-            "created_at"
-        ).order_by("-created_at")
-
-        return Response(data)
+        return Response([{"date": str(r["day"]), "purchase": r["purchase"], "vendors": r["vendors"]} for r in rows])
 
 
 class DailyProfitReportView(APIView):
     permission_classes = [IsAdminRole]
 
     def get(self, request):
+        date_param = _as_date(request.GET.get("date")) or timezone.localdate()
 
-        date = request.GET.get("date")
+        revenue = (
+            Order.objects.filter(status="COMPLETED", created_at__date=date_param).aggregate(
+                total=Coalesce(
+                    Sum("total_amount"),
+                    Decimal("0.00"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                )
+            )["total"]
+            or Decimal("0.00")
+        )
 
-        if not date:
-            return Response(
-                {"error": "date required (YYYY-MM-DD)"},
-                status=400
-            )
+        cost = (
+            PurchaseItem.objects.filter(invoice__created_at__date=date_param).aggregate(
+                total=Coalesce(
+                    Sum(
+                        F("quantity") * F("unit_price"),
+                        output_field=DecimalField(max_digits=12, decimal_places=2),
+                    ),
+                    Decimal("0.00"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                )
+            )["total"]
+            or Decimal("0.00")
+        )
 
-        date = parse_date(date)
+        return Response([{"date": str(date_param), "revenue": revenue, "cost": cost, "profit": revenue - cost}])
 
-        # Total Sales
-        sales = Order.objects.filter(
-            status="COMPLETED",
-            created_at__date=date
-        ).aggregate(
-            total=Coalesce(
-                Sum("total_amount"),
-                0,
-                output_field=DecimalField(max_digits=12, decimal_places=2)
-            )
-        )["total"]
-
-        # Total Purchase Cost
-        cost = PurchaseItem.objects.filter(
-            invoice__created_at__date=date
-        ).aggregate(
-            total=Coalesce(
-                Sum(
-                    F("quantity") * F("unit_price"),
-                    output_field=DecimalField(max_digits=12, decimal_places=2)
-                ),
-                0,
-                output_field=DecimalField(max_digits=12, decimal_places=2)
-            )
-        )["total"]
-
-        profit = sales - cost
-
-        return Response({
-            "date": str(date),
-            "sales": sales,
-            "cost": cost,
-            "profit": profit
-        })
-
-class StockConsumptionReportView(APIView):
-    permission_classes = [IsAdminRole]
-
-    def get(self, request):
-
-        date = request.GET.get("date")
-
-        if not date:
-            return Response(
-                {"error": "date required (YYYY-MM-DD)"},
-                status=400
-            )
-
-        date = parse_date(date)
-
-        data = StockLog.objects.filter(
-            created_at__date=date,
-            reason="SALE"
-        ).values(
-            "ingredient__name",
-            "ingredient__unit"
-        ).annotate(
-            used=Coalesce(
-                Sum("change") * -1,
-                0,
-                output_field=DecimalField(max_digits=12, decimal_places=3)
-            )
-        ).order_by("ingredient__name")
-
-        return Response(data)
 
 class GSTReportView(APIView):
     permission_classes = [IsAdminRole]
 
     def get(self, request):
+        gst_rate = Decimal("0.05")
 
-        start = request.GET.get("start")
-        end = request.GET.get("end")
+        date_param = _as_date(request.GET.get("date"))
+        start = _as_date(request.GET.get("start"))
+        end = _as_date(request.GET.get("end"))
 
         qs = Order.objects.filter(status="COMPLETED")
-
-        if start and end:
-            qs = qs.filter(
-                created_at__date__range=[start, end]
+        if date_param:
+            qs = qs.filter(created_at__date=date_param)
+            rows = (
+                qs.annotate(day=TruncDate("created_at"))
+                .values("day")
+                .annotate(
+                    gross_sales=Coalesce(
+                        Sum("total_amount"),
+                        Decimal("0.00"),
+                        output_field=DecimalField(max_digits=12, decimal_places=2),
+                    )
+                )
+                .order_by("day")
             )
-
-        total_sales = qs.aggregate(
-            total=Coalesce(
-                Sum("total_amount"),
-                Decimal("0.00"),
-                output_field=DecimalField(max_digits=12, decimal_places=2)
+        elif start and end:
+            rows = (
+                qs.filter(created_at__date__range=[start, end])
+                .annotate(day=TruncDate("created_at"))
+                .values("day")
+                .annotate(
+                    gross_sales=Coalesce(
+                        Sum("total_amount"),
+                        Decimal("0.00"),
+                        output_field=DecimalField(max_digits=12, decimal_places=2),
+                    )
+                )
+                .order_by("day")
             )
-        )["total"]
+        else:
+            today = timezone.localdate()
+            rows = [
+                {
+                    "day": today,
+                    "gross_sales": qs.filter(created_at__date=today).aggregate(
+                        total=Coalesce(
+                            Sum("total_amount"),
+                            Decimal("0.00"),
+                            output_field=DecimalField(max_digits=12, decimal_places=2),
+                        )
+                    )["total"],
+                }
+            ]
 
-        gst_rate = Decimal("0.05")   # 5% as Decimal
+        data = []
+        divisor = Decimal("1.00") + gst_rate
+        for row in rows:
+            gross = row["gross_sales"] or Decimal("0.00")
+            taxable = gross / divisor if divisor else Decimal("0.00")
+            gst_amount = gross - taxable
+            data.append(
+                {
+                    "date": str(row["day"]),
+                    "taxable_amount": taxable,
+                    "gst_amount": gst_amount,
+                }
+            )
+        return Response(data)
 
-        gst_amount = total_sales * gst_rate
 
-        return Response({
-            "sales": total_sales,
-            "gst_rate": "5%",
-            "gst_amount": gst_amount
-        })
+class StockConsumptionReportView(APIView):
+    permission_classes = [IsAdminRole]
+
+    def get(self, request):
+        date_param = _as_date(request.GET.get("date")) or timezone.localdate()
+
+        latest_price_subquery = (
+            PurchaseItem.objects.filter(ingredient=OuterRef("ingredient"))
+            .order_by("-invoice__created_at")
+            .values("unit_price")[:1]
+        )
+
+        rows = (
+            StockLog.objects.filter(created_at__date=date_param, reason="SALE")
+            .values("ingredient", "ingredient__name", "ingredient__unit")
+            .annotate(
+                consumed_qty=Coalesce(
+                    Sum(F("change") * Value(-1), output_field=DecimalField(max_digits=12, decimal_places=3)),
+                    Decimal("0.000"),
+                    output_field=DecimalField(max_digits=12, decimal_places=3),
+                ),
+                unit_cost=Coalesce(
+                    Subquery(latest_price_subquery, output_field=DecimalField(max_digits=12, decimal_places=2)),
+                    Value(Decimal("0.00")),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                ),
+            )
+            .order_by("ingredient__name")
+        )
+
+        data = []
+        for row in rows:
+            data.append(
+                {
+                    "item": row["ingredient__name"],
+                    "consumed_qty": row["consumed_qty"],
+                    "unit": row["ingredient__unit"],
+                    "cost": row["consumed_qty"] * row["unit_cost"],
+                }
+            )
+        return Response(data)
+
 
 class WastageReportView(APIView):
     permission_classes = [IsAdminRole]
 
     def get(self, request):
+        date_param = _as_date(request.GET.get("date"))
+        start = _as_date(request.GET.get("start"))
+        end = _as_date(request.GET.get("end"))
 
-        start = request.GET.get("start")
-        end = request.GET.get("end")
-
-        qs = StockLog.objects.filter(
-            reason__in=["ADJUSTMENT", "MANUAL"]
+        latest_price_subquery = (
+            PurchaseItem.objects.filter(ingredient=OuterRef("ingredient"))
+            .order_by("-invoice__created_at")
+            .values("unit_price")[:1]
         )
 
-        if start and end:
-            qs = qs.filter(
-                created_at__date__range=[start, end]
-            )
+        qs = StockLog.objects.filter(reason__in=["ADJUSTMENT", "MANUAL"], change__lt=0)
+        if date_param:
+            qs = qs.filter(created_at__date=date_param)
+        elif start and end:
+            qs = qs.filter(created_at__date__range=[start, end])
 
-        data = qs.values(
-            "ingredient__name",
-            "reason"
-        ).annotate(
-            total=Coalesce(
-                Sum("change"),
-                0,
-                output_field=DecimalField(max_digits=12, decimal_places=3)
+        rows = (
+            qs.values("ingredient", "ingredient__name", "ingredient__unit")
+            .annotate(
+                wasted_qty=Coalesce(
+                    Sum(F("change") * Value(-1), output_field=DecimalField(max_digits=12, decimal_places=3)),
+                    Decimal("0.000"),
+                    output_field=DecimalField(max_digits=12, decimal_places=3),
+                ),
+                unit_cost=Coalesce(
+                    Subquery(latest_price_subquery, output_field=DecimalField(max_digits=12, decimal_places=2)),
+                    Value(Decimal("0.00")),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                ),
             )
-        ).order_by("ingredient__name")
+            .order_by("ingredient__name")
+        )
 
-        return Response(data)
+        return Response(
+            [
+                {
+                    "item": r["ingredient__name"],
+                    "wasted_qty": r["wasted_qty"],
+                    "unit": r["ingredient__unit"],
+                    "wastage_cost": r["wasted_qty"] * r["unit_cost"],
+                }
+                for r in rows
+            ]
+        )
+
 
 class LowStockReportView(APIView):
     permission_classes = [IsAdminOrStaff]
 
     def get(self, request):
+        rows = Ingredient.objects.filter(current_stock__lte=F("min_stock")).order_by("name")
+        return Response(
+            [
+                {
+                    "item": row.name,
+                    "current_qty": row.current_stock,
+                    "reorder_level": row.min_stock,
+                    "unit": row.unit,
+                }
+                for row in rows
+            ]
+        )
 
-        data = Ingredient.objects.filter(
-            current_stock__lte=F("min_stock")
-        ).values(
-            "name",
-            "unit",
-            "current_stock",
-            "min_stock"
-        ).order_by("name")
-
-        return Response(data)
 
 class PeakTimeReportView(APIView):
     permission_classes = [IsAdminOrStaff]
 
     def get(self, request):
-
-        start = request.GET.get("start")
-        end = request.GET.get("end")
+        start = _as_date(request.GET.get("start"))
+        end = _as_date(request.GET.get("end"))
 
         qs = Order.objects.filter(status="COMPLETED")
-
+        if request.user.role == "STAFF":
+            qs = qs.filter(staff=request.user)
         if start and end:
-            qs = qs.filter(
-                created_at__date__range=[start, end]
+            qs = qs.filter(created_at__date__range=[start, end])
+
+        rows = (
+            qs.annotate(hour=ExtractHour("created_at"))
+            .values("hour")
+            .annotate(
+                orders=Count("id"),
+                sales=Coalesce(
+                    Sum("total_amount"),
+                    Decimal("0.00"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                ),
             )
+            .order_by("hour")
+        )
 
-        data = qs.annotate(
-            hour=ExtractHour("created_at")
-        ).values("hour").annotate(
-            total=Count("id")
-        ).order_by("-total")
+        return Response(
+            [
+                {
+                    "hour": f"{int(r['hour']):02d}:00",
+                    "orders": r["orders"],
+                    "sales": r["sales"],
+                }
+                for r in rows
+                if r["hour"] is not None
+            ]
+        )
 
-        return Response(data)
 
 class StaffPerformanceReportView(APIView):
     permission_classes = [IsAdminRole]
 
     def get(self, request):
+        start = _as_date(request.GET.get("start"))
+        end = _as_date(request.GET.get("end"))
 
-        start = request.GET.get("start")
-        end = request.GET.get("end")
+        qs = Order.objects.filter(status="COMPLETED", staff__isnull=False)
+        if start and end:
+            qs = qs.filter(created_at__date__range=[start, end])
 
-        qs = Order.objects.filter(
-            status="COMPLETED",
-            staff__isnull=False
+        rows = (
+            qs.values("staff__username")
+            .annotate(
+                orders_handled=Count("id"),
+                sales=Coalesce(
+                    Sum("total_amount"),
+                    Decimal("0.00"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                ),
+            )
+            .order_by("-sales")
         )
 
-        if start and end:
-            qs = qs.filter(
-                created_at__date__range=[start, end]
+        return Response(
+            [{"staff": r["staff__username"], "orders_handled": r["orders_handled"], "sales": r["sales"]} for r in rows]
+        )
+
+
+class StaffLoginLogoutReportView(APIView):
+    permission_classes = [IsAdminRole]
+
+    def get(self, request):
+        date_param = _as_date(request.GET.get("date")) or timezone.localdate()
+
+        logs = (
+            StaffSessionLog.objects
+            .filter(
+                user__role="STAFF",
+                login_at__date=date_param,
             )
+            .select_related("user")
+            .order_by("login_at")
+        )
 
-        data = qs.values(
-            "staff__username"
-        ).annotate(
-            total_sales=Coalesce(
-                Sum("total_amount"),
-                0,
-                output_field=DecimalField(max_digits=12, decimal_places=2)
-            ),
-            total_orders=Count("id")
-        ).order_by("-total_sales")
-
+        data = [
+            {
+                "date": str(date_param),
+                "staff": log.user.username,
+                "login_time": timezone.localtime(log.login_at).strftime("%H:%M:%S"),
+                "logout_time": timezone.localtime(log.logout_at).strftime("%H:%M:%S") if log.logout_at else None,
+                "login_at_iso": timezone.localtime(log.login_at).isoformat(),
+                "logout_at_iso": timezone.localtime(log.logout_at).isoformat() if log.logout_at else None,
+            }
+            for log in logs
+        ]
         return Response(data)
+
 
 class DiscountAbuseReportView(APIView):
     permission_classes = [IsAdminRole]
 
     def get(self, request):
+        start = _as_date(request.GET.get("start"))
+        end = _as_date(request.GET.get("end"))
 
-        start = request.GET.get("start")
-        end = request.GET.get("end")
+        qs = Order.objects.filter(status="COMPLETED", discount_amount__gt=0)
+        if start and end:
+            qs = qs.filter(created_at__date__range=[start, end])
 
-        qs = Order.objects.filter(
-            status="COMPLETED",
-            discount_amount__gt=0
+        rows = (
+            qs.values("staff__username")
+            .annotate(
+                discount_count=Count("id"),
+                discount_amount=Coalesce(
+                    Sum("discount_amount"),
+                    Decimal("0.00"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                ),
+            )
+            .order_by("-discount_amount")
         )
 
-        if start and end:
-            qs = qs.filter(
-                created_at__date__range=[start, end]
-            )
+        return Response(
+            [
+                {
+                    "staff": r["staff__username"] or "Unknown",
+                    "discount_count": r["discount_count"],
+                    "discount_amount": r["discount_amount"],
+                }
+                for r in rows
+            ]
+        )
 
-        data = qs.values(
-            "staff__username"
-        ).annotate(
-            total_discount=Coalesce(
-                Sum("discount_amount"),
-                0,
-                output_field=DecimalField(max_digits=12, decimal_places=2)
-            ),
-            orders=Count("id")
-        ).order_by("-total_discount")
-
-        return Response(data)
 
 class CancelledOrdersReportView(APIView):
     permission_classes = [IsAdminRole]
 
     def get(self, request):
+        start = _as_date(request.GET.get("start"))
+        end = _as_date(request.GET.get("end"))
 
-        start = request.GET.get("start")
-        end = request.GET.get("end")
+        qs = Order.objects.filter(status="CANCELLED")
+        if start and end:
+            qs = qs.filter(created_at__date__range=[start, end])
 
-        qs = Order.objects.filter(
-            status="CANCELLED"
+        rows = (
+            qs.annotate(day=TruncDate("created_at"))
+            .values("day")
+            .annotate(
+                cancelled_orders=Count("id"),
+                cancelled_value=Coalesce(
+                    Sum("total_amount"),
+                    Decimal("0.00"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                ),
+            )
+            .order_by("day")
         )
 
-        if start and end:
-            qs = qs.filter(
-                created_at__date__range=[start, end]
-            )
+        return Response(
+            [
+                {
+                    "date": str(r["day"]),
+                    "cancelled_orders": r["cancelled_orders"],
+                    "cancelled_value": r["cancelled_value"],
+                }
+                for r in rows
+            ]
+        )
 
-        data = qs.values(
-            "id",
-            "staff__username",
-            "total_amount",
-            "created_at"
-        ).order_by("-created_at")
-
-        return Response(data)
 
 class DashboardSummaryView(APIView):
     permission_classes = [IsAdminOrStaff]
 
     def get(self, request):
+        today = timezone.localdate()
 
-        today = timezone.now().date()
+        order_qs = Order.objects.filter(created_at__date=today)
         if request.user.role == "STAFF":
-            sales_qs = Order.objects.filter(
-            status="COMPLETED",
-            created_at__date=today,
-            staff=request.user
-        )
-        else:
-            sales_qs = Order.objects.filter(
-            status="COMPLETED",
-            created_at__date=today
-        )   
+            order_qs = order_qs.filter(staff=request.user)
 
-        # Sales
+        sales_qs = order_qs.filter(status="COMPLETED")
+
         sales = sales_qs.aggregate(
             total=Coalesce(
                 Sum("total_amount"),
-                0,
-                output_field=DecimalField(max_digits=12, decimal_places=2)
+                Decimal("0.00"),
+                output_field=DecimalField(max_digits=12, decimal_places=2),
             )
         )["total"]
+        orders = order_qs.count()
 
-        # Orders
-        orders = Order.objects.filter(
-            created_at__date=today
-        ).count()
+        completed_orders = sales_qs.count()
+        avg_order_value = sales / completed_orders if completed_orders > 0 else Decimal("0.00")
 
-        # Profit
-        cost = PurchaseItem.objects.filter(
-            invoice__created_at__date=today
-        ).aggregate(
+        cost = PurchaseItem.objects.filter(invoice__created_at__date=today).aggregate(
             total=Coalesce(
                 Sum(
                     F("quantity") * F("unit_price"),
-                    output_field=DecimalField(max_digits=12, decimal_places=2)
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
                 ),
-                0,
-                output_field=DecimalField(max_digits=12, decimal_places=2)
+                Decimal("0.00"),
+                output_field=DecimalField(max_digits=12, decimal_places=2),
             )
         )["total"]
 
-        profit = sales - cost
+        low_stock = Ingredient.objects.filter(current_stock__lte=F("min_stock")).count()
+        top = (
+            OrderItem.objects.filter(order__in=sales_qs, product__isnull=False)
+            .values("product__name")
+            .annotate(qty=Coalesce(Sum("quantity"), 0))
+            .order_by("-qty")
+            .first()
+        )
+        top_product = top["product__name"] if top else "N/A"
 
-        # Low stock
-        low_stock = Ingredient.objects.filter(
-            current_stock__lte=F("min_stock")
-        ).count()
+        metrics = [
+            {"metric": "Total Sales", "value": sales},
+            {"metric": "Total Orders", "value": orders},
+            {"metric": "Average Order Value", "value": avg_order_value},
+            {"metric": "Profit", "value": sales - cost},
+            {"metric": "Low Stock Items", "value": low_stock},
+            {"metric": "Active Staff", "value": User.objects.filter(role="STAFF", is_active=True).count()},
+            {"metric": "Top Product", "value": top_product},
+        ]
 
-        # Top product
-        top = OrderItem.objects.filter(
-            order__status="COMPLETED",
-            order__created_at__date=today
-        ).values(
-            "product__name"
-        ).annotate(
-            qty=Sum("quantity")
-        ).order_by("-qty").first()
+        return Response(metrics)
 
-        top_product = top["product__name"] if top else None
-
-        return Response({
-            "date": str(today),
-            "sales": sales,
-            "profit": profit,
-            "orders": orders,
-            "low_stock_items": low_stock,
-            "top_product": top_product
-        })
 
 class ComboPerformanceReportView(APIView):
     permission_classes = [IsAdminRole]
+
     def get(self, request):
+        start = _as_date(request.GET.get("start"))
+        end = _as_date(request.GET.get("end"))
 
-        start = request.GET.get("start")
-        end = request.GET.get("end")
+        qs = OrderItem.objects.filter(order__status="COMPLETED", combo__isnull=False)
+        if start and end:
+            qs = qs.filter(order__created_at__date__range=[start, end])
 
-        qs = OrderItem.objects.filter(
-            order__status="COMPLETED",
-            combo__isnull=False
+        rows = (
+            qs.values("combo__name")
+            .annotate(
+                qty=Coalesce(Sum("quantity"), 0),
+                sales=Coalesce(
+                    Sum(
+                        F("quantity") * F("price_at_time"),
+                        output_field=DecimalField(max_digits=12, decimal_places=2),
+                    ),
+                    Decimal("0.00"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                ),
+            )
+            .order_by("-qty")
         )
 
-        if start and end:
-            qs = qs.filter(
-                order__created_at__date__range=[start, end]
-            )
-
-        data = qs.values(
-            "combo__name"
-        ).annotate(
-            total_qty=Sum("quantity"),
-            total_sales=Coalesce(
-                Sum(F("quantity") * F("price_at_time")),
-                0,
-                output_field=DecimalField(max_digits=12, decimal_places=2)
-            )
-        ).order_by("-total_qty")
-
-        return Response(data)
+        return Response([{"combo": r["combo__name"], "qty": r["qty"], "sales": r["sales"]} for r in rows])

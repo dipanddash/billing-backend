@@ -29,6 +29,18 @@ class CategoryListCreateView(generics.ListCreateAPIView):
             return [IsAdminRole()]
         return [IsAuthenticated()]
 
+
+class CategoryRetrieveUpdateDeleteView(generics.RetrieveUpdateDestroyAPIView):
+
+    queryset = Category.objects.all()
+    serializer_class = CategorySerializer
+    parser_classes = [MultiPartParser, FormParser]
+
+    def get_permissions(self):
+        if self.request.method in ["PUT", "PATCH", "DELETE"]:
+            return [IsAdminRole()]
+        return [IsAuthenticated()]
+
 # ----------------------------
 # PRODUCT
 # ----------------------------

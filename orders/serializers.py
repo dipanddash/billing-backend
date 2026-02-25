@@ -270,12 +270,19 @@ class KitchenOrderItemSerializer(serializers.ModelSerializer):
         source="product.name",
         read_only=True
     )
+    product_image = serializers.SerializerMethodField()
+
+    def get_product_image(self, obj):
+        if obj.product and obj.product.image:
+            return obj.product.image.url
+        return None
 
     class Meta:
         model = OrderItem
         fields = [
             "product_name",
-            "quantity"
+            "quantity",
+            "product_image"
         ]
 
 
@@ -286,10 +293,12 @@ class KitchenOrderSerializer(serializers.ModelSerializer):
         read_only=True
     )
 
-    customer_name = serializers.CharField(
-        source="session.customer_name",
+    order_type = serializers.CharField(
         read_only=True
     )
+    order_id = serializers.SerializerMethodField()
+
+    customer_name = serializers.SerializerMethodField()
 
     items = KitchenOrderItemSerializer(
         many=True,
@@ -300,11 +309,33 @@ class KitchenOrderSerializer(serializers.ModelSerializer):
         model = Order
         fields = [
             "id",
+            "order_id",
             "status",
+
+            "order_type",      # ✅ IMPORTANT
+
             "table_name",
             "customer_name",
+
             "items"
         ]
+
+    def get_order_id(self, obj):
+        if obj.order_number is not None:
+            return f"{obj.order_number:03d}"
+        return None
+
+    def get_customer_name(self, obj):
+
+        # ✅ DINE IN → from session
+        if obj.order_type == "DINE_IN" and obj.session:
+            return obj.session.customer_name
+
+        # ✅ TAKEAWAY → from customer model
+        if obj.order_type == "TAKEAWAY" and obj.customer:
+            return obj.customer.name
+
+        return obj.customer_name
 
 
 class OrderListSerializer(serializers.ModelSerializer):
@@ -314,21 +345,21 @@ class OrderListSerializer(serializers.ModelSerializer):
         read_only=True
     )
 
-    customer_name = serializers.CharField(
-        source="customer.name",
-        read_only=True
-    )
+    customer_name = serializers.SerializerMethodField()
 
     items_count = serializers.IntegerField(
         source="items.count",
         read_only=True
     )
+    order_id = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
 
         fields = [
             "id",
+            "order_id",
+            "order_type",
             "table_name",
             "customer_name",
             "items_count",
@@ -341,6 +372,16 @@ class OrderListSerializer(serializers.ModelSerializer):
             "created_at",
             "bill_number"
         ]
+
+    def get_order_id(self, obj):
+        if obj.order_number is not None:
+            return f"{obj.order_number:03d}"
+        return None
+
+    def get_customer_name(self, obj):
+        if obj.customer and obj.customer.name:
+            return obj.customer.name
+        return obj.customer_name
         
 class OrderDetailSerializer(serializers.ModelSerializer):
 
@@ -353,15 +394,19 @@ class OrderDetailSerializer(serializers.ModelSerializer):
         source="session.token_number",
         read_only=True
     )
+    session = serializers.SerializerMethodField()
 
     customer_name = serializers.CharField(read_only=True)
     customer_phone = serializers.CharField(read_only=True)
+    order_id = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
 
         fields = [
             "id",
+            "order_id",
+            "session",
             "order_type",
             "status",
             "payment_status",
@@ -375,3 +420,13 @@ class OrderDetailSerializer(serializers.ModelSerializer):
             "created_at",
             "total_amount",
         ]
+
+    def get_order_id(self, obj):
+        if obj.order_number is not None:
+            return f"{obj.order_number:03d}"
+        return None
+
+    def get_session(self, obj):
+        if obj.session_id:
+            return str(obj.session_id)
+        return None

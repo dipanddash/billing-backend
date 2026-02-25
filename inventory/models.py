@@ -47,7 +47,11 @@ class OpeningStock(models.Model):
 class Vendor(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=150)
+    category = models.CharField(max_length=100, blank=True, null=True)
+    contact_person = models.CharField(max_length=150, blank=True, null=True)
     phone = models.CharField(max_length=20)
+    email = models.EmailField(blank=True, null=True)
+    city = models.CharField(max_length=100, blank=True, null=True)
     address = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 

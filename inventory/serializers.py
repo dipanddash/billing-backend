@@ -1,5 +1,9 @@
 from rest_framework import serializers
 from django.db import transaction
+from django.db.models import DecimalField, F, Sum
+from django.db.models.functions import Coalesce
+from django.utils import timezone
+from decimal import Decimal
 
 from .models import (
     Ingredient,
@@ -26,10 +30,60 @@ class IngredientSerializer(serializers.ModelSerializer):
 # -----------------------
 
 class VendorSerializer(serializers.ModelSerializer):
+    contact = serializers.CharField(source="contact_person", required=False, allow_null=True, allow_blank=True)
+    lastDelivery = serializers.SerializerMethodField()
+    monthlySpend = serializers.SerializerMethodField()
 
     class Meta:
         model = Vendor
-        fields = "__all__"
+        fields = [
+            "id",
+            "name",
+            "category",
+            "contact",
+            "phone",
+            "email",
+            "city",
+            "address",
+            "created_at",
+            "lastDelivery",
+            "monthlySpend",
+        ]
+
+    def get_lastDelivery(self, obj):
+        last_invoice = obj.purchaseinvoice_set.order_by("-created_at").first()
+        if not last_invoice:
+            return None
+        return last_invoice.created_at.date().isoformat()
+
+    def get_monthlySpend(self, obj):
+        today = timezone.localdate()
+        total = (
+            PurchaseItem.objects
+            .filter(
+                invoice__vendor=obj,
+                invoice__created_at__year=today.year,
+                invoice__created_at__month=today.month
+            )
+            .aggregate(
+                total=Coalesce(
+                    Sum(
+                        F("quantity") * F("unit_price"),
+                        output_field=DecimalField(max_digits=12, decimal_places=2)
+                    ),
+                    Decimal("0.00"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2)
+                )
+            )["total"]
+        )
+        return total
+
+
+class VendorHistorySerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    invoice_number = serializers.CharField()
+    date = serializers.DateField()
+    total_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
 
 
 # -----------------------

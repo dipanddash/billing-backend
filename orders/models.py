@@ -1,5 +1,6 @@
 import uuid
 from django.db import models
+from django.db import transaction
 from django.conf import settings
 from django.core.exceptions import ValidationError
 # add this import
@@ -101,8 +102,26 @@ class Order(models.Model):
         blank=True,
         null=True
     )
+    order_number = models.PositiveIntegerField(
+        unique=True,
+        null=True,
+        blank=True
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
+
+    def save(self, *args, **kwargs):
+        if self.order_number is None:
+            with transaction.atomic():
+                last_order = (
+                    Order.objects
+                    .select_for_update()
+                    .exclude(order_number__isnull=True)
+                    .order_by("-order_number")
+                    .first()
+                )
+                self.order_number = (last_order.order_number if last_order else 0) + 1
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return str(self.id)

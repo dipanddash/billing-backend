@@ -11,6 +11,7 @@ class User(AbstractUser):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     role = models.CharField(max_length=10, choices=ROLE_CHOICES)
+    phone = models.CharField(max_length=20, blank=True, null=True)
 
     def __str__(self):
         return f"{self.username} - {self.role}"
@@ -28,3 +29,19 @@ class Customer(models.Model):
 
     def __str__(self):
         return f"{self.name} - {self.phone}"
+
+
+class StaffSessionLog(models.Model):
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="session_logs",
+    )
+    login_at = models.DateTimeField(auto_now_add=True)
+    logout_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-login_at"]
+
+    def __str__(self):
+        return f"{self.user.username} ({self.login_at})"

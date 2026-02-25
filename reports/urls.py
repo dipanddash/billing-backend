@@ -5,6 +5,8 @@ urlpatterns = [
 
     path("sales/daily/", DailySalesReportView.as_view()),
     path("sales/product/", ProductSalesReportView.as_view()),
+    path("category/sales/", CategorySalesReportView.as_view()),
+    path("top-dishes/", TopDishesReportView.as_view()),
     path("payments/method/", PaymentMethodReportView.as_view()),
 
     path("stock/current/", CurrentStockReportView.as_view()),
@@ -17,7 +19,8 @@ urlpatterns = [
     path("stock/low/", LowStockReportView.as_view()),
     path("sales/peak-time/", PeakTimeReportView.as_view()),
     path("staff/performance/", StaffPerformanceReportView.as_view()),
-    path("discount/abuse/", DiscountAbuseReportView.as_view()),
+    path("staff/login-logout/", StaffLoginLogoutReportView.as_view()),
+    path("discount/abuse/", DiscountAbuseReportView.as_view()),   
     path("orders/cancelled/", CancelledOrdersReportView.as_view()),
     path("dashboard/", DashboardSummaryView.as_view()),
     path("combo/performance/", ComboPerformanceReportView.as_view()),
