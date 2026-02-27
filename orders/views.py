@@ -1,9 +1,10 @@
 from decimal import Decimal
 from datetime import datetime, timedelta
-from itertools import product
+from collections import defaultdict
 
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Count, Sum, F, DecimalField, Prefetch
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from rest_framework import generics, status
@@ -14,7 +15,7 @@ from rest_framework.exceptions import ValidationError
 from accounts.models import Customer
 from accounts.permissions import IsAdminOrStaff, IsAdminRole
 from payments.models import Payment
-from inventory.models import StockLog
+from inventory.models import StockLog, Ingredient
 from products.models import Product, Recipe, Combo
 from tables.models import TableSession
 
@@ -221,7 +222,12 @@ class OrderPaymentView(APIView):
             order = (
                 Order.objects
                 .select_related("table", "session")
-                .prefetch_related("items")
+                .prefetch_related(
+                    Prefetch(
+                        "items",
+                        queryset=OrderItem.objects.select_related("product", "combo").prefetch_related("combo__items__product"),
+                    )
+                )
                 .get(pk=pk)
             )
 
@@ -277,20 +283,19 @@ class OrderPaymentView(APIView):
             last_order = (
                 Order.objects
                 .filter(bill_number__isnull=False)
+                .only("bill_number")
                 .order_by("-created_at")
-                .all()
+                .first()
             )
 
             next_number = 1
-            for prev_order in last_order:
+            if last_order:
                 try:
-                    digits = "".join(ch for ch in str(prev_order.bill_number) if ch.isdigit())
-                    if not digits:
-                        continue
-                    next_number = int(digits) + 1
-                    break
+                    digits = "".join(ch for ch in str(last_order.bill_number) if ch.isdigit())
+                    if digits:
+                        next_number = int(digits) + 1
                 except (TypeError, ValueError):
-                    continue
+                    pass
 
             bill_no = format_bill_number(next_number)
 
@@ -305,67 +310,76 @@ class OrderPaymentView(APIView):
             # -------------------------
             # Stock Deduction
             # -------------------------
-            for item in order.items.all():
+            order_items = list(order.items.all())
+            product_ids = set()
 
-                if item.product:
+            for item in order_items:
+                if item.product_id:
+                    product_ids.add(item.product_id)
+                elif item.combo_id:
+                    for combo_item in item.combo.items.all():
+                        product_ids.add(combo_item.product_id)
 
-                    recipes = Recipe.objects.filter(
-                        product=item.product
-                    )
+            recipes_by_product = defaultdict(list)
+            if product_ids:
+                recipes = (
+                    Recipe.objects
+                    .filter(product_id__in=product_ids)
+                    .select_related("ingredient", "product")
+                )
+                for recipe in recipes:
+                    recipes_by_product[recipe.product_id].append(recipe)
 
-                    if not recipes.exists():
-                        raise ValidationError(
-                            f"No recipe for {item.product.name}"
-                        )
+            ingredient_usage = defaultdict(Decimal)
 
-                    for recipe in recipes:
+            for item in order_items:
+                if item.product_id:
+                    item_recipes = recipes_by_product.get(item.product_id, [])
+                    if not item_recipes:
+                        raise ValidationError(f"No recipe for {item.product.name}")
 
-                        used_qty = recipe.quantity * item.quantity
-                        ingredient = recipe.ingredient
+                    for recipe in item_recipes:
+                        ingredient_usage[recipe.ingredient_id] += recipe.quantity * item.quantity
 
-                        if ingredient.current_stock < used_qty:
-                            raise ValidationError(
-                                f"Not enough stock for {ingredient.name}"
-                            )
+                elif item.combo_id:
+                    for combo_product in item.combo.items.all():
+                        item_recipes = recipes_by_product.get(combo_product.product_id, [])
+                        if not item_recipes:
+                            raise ValidationError(f"No recipe for {combo_product.product.name}")
 
-                        ingredient.current_stock -= used_qty
-                        ingredient.save()
+                        combined_qty = combo_product.quantity * item.quantity
+                        for recipe in item_recipes:
+                            ingredient_usage[recipe.ingredient_id] += recipe.quantity * combined_qty
 
-                        StockLog.objects.create(
+            if ingredient_usage:
+                ingredients = {
+                    ingredient.id: ingredient
+                    for ingredient in Ingredient.objects.select_for_update().filter(id__in=ingredient_usage.keys())
+                }
+                updated_ingredients = []
+                stock_logs = []
+
+                for ingredient_id, used_qty in ingredient_usage.items():
+                    ingredient = ingredients.get(ingredient_id)
+                    if ingredient is None:
+                        raise ValidationError("Ingredient not found for stock deduction")
+
+                    if ingredient.current_stock < used_qty:
+                        raise ValidationError(f"Not enough stock for {ingredient.name}")
+
+                    ingredient.current_stock -= used_qty
+                    updated_ingredients.append(ingredient)
+                    stock_logs.append(
+                        StockLog(
                             ingredient=ingredient,
                             change=-used_qty,
                             reason="SALE",
                             user=log_user
                         )
-                elif item.combo:
-                    combo_products = item.combo.items.select_related("product").all()
-                    for combo_product in combo_products:
-                        recipes = Recipe.objects.filter(product=combo_product.product)
+                    )
 
-                        if not recipes.exists():
-                            raise ValidationError(
-                                f"No recipe for {combo_product.product.name}"
-                            )
-
-                        combined_qty = combo_product.quantity * item.quantity
-                        for recipe in recipes:
-                            used_qty = recipe.quantity * combined_qty
-                            ingredient = recipe.ingredient
-
-                            if ingredient.current_stock < used_qty:
-                                raise ValidationError(
-                                    f"Not enough stock for {ingredient.name}"
-                                )
-
-                            ingredient.current_stock -= used_qty
-                            ingredient.save()
-
-                            StockLog.objects.create(
-                                ingredient=ingredient,
-                                change=-used_qty,
-                                reason="SALE",
-                                user=log_user
-                            )
+                Ingredient.objects.bulk_update(updated_ingredients, ["current_stock"])
+                StockLog.objects.bulk_create(stock_logs)
 
             # -------------------------
             # Close Session + Free Table
@@ -374,11 +388,11 @@ class OrderPaymentView(APIView):
 
                 order.session.is_active = False
                 order.session.closed_at = timezone.now()
-                order.session.save()
+                order.session.save(update_fields=["is_active", "closed_at"])
 
                 table = order.session.table
                 table.status = "AVAILABLE"
-                table.save()
+                table.save(update_fields=["status"])
 
         return Response(
             {
@@ -401,7 +415,15 @@ class OrderInvoiceView(APIView):
     def get(self, request, pk):
 
         try:
-            order = Order.objects.get(pk=pk, status="COMPLETED")
+            order = (
+                Order.objects
+                .select_related("staff")
+                .prefetch_related(
+                    Prefetch("items", queryset=OrderItem.objects.select_related("product", "combo")),
+                    "payments",
+                )
+                .get(pk=pk, status="COMPLETED")
+            )
 
         except Order.DoesNotExist:
             return Response(
@@ -415,7 +437,7 @@ class OrderInvoiceView(APIView):
         total_gst = Decimal("0.00")
         grand_total = Decimal("0.00")
 
-        payment = order.payments.filter(status="SUCCESS").last()
+        payment = next((pay for pay in reversed(list(order.payments.all())) if pay.status == "SUCCESS"), None)
 
         for item in order.items.all():
 
@@ -474,25 +496,23 @@ class AddOrderItemsView(APIView):
     permission_classes = [IsAdminOrStaff]
 
     def post(self, request, order_id):
-
         try:
             order = Order.objects.get(id=order_id)
-
         except Order.DoesNotExist:
             return error_response("Order not found", 404)
 
         items = request.data.get("items", [])
-
         if not items:
             return error_response("No items provided", 400)
 
-        # Remove old items
         order.items.all().delete()
 
         total = Decimal("0.00")
+        prepared_items = []
+        product_ids = set()
+        combo_ids = set()
 
         for idx, item in enumerate(items):
-
             product_id = item.get("product")
             combo_id = item.get("combo")
 
@@ -524,27 +544,44 @@ class AddOrderItemsView(APIView):
                     {"item_index": idx},
                 )
 
+            if product_id:
+                product_ids.add(str(product_id))
+            else:
+                combo_ids.add(str(combo_id))
+
+            prepared_items.append(
+                {
+                    "item_index": idx,
+                    "product_id": str(product_id) if product_id else None,
+                    "combo_id": str(combo_id) if combo_id else None,
+                    "quantity": qty,
+                }
+            )
+
+        products_map = {str(product.id): product for product in Product.objects.filter(id__in=product_ids)}
+        combos_map = {str(combo.id): combo for combo in Combo.objects.filter(id__in=combo_ids)}
+
+        order_items_to_create = []
+        for item in prepared_items:
             product = None
             combo = None
-            if product_id:
-                try:
-                    product = Product.objects.get(id=product_id)
-                except Product.DoesNotExist:
+            if item["product_id"]:
+                product = products_map.get(item["product_id"])
+                if not product:
                     return error_response(
                         "Invalid product id",
                         400,
-                        {"item_index": idx, "product": str(product_id)},
+                        {"item_index": item["item_index"], "product": item["product_id"]},
                     )
                 base_price = product.price
                 gst_percent = product.gst_percent or Decimal("0.00")
             else:
-                try:
-                    combo = Combo.objects.get(id=combo_id)
-                except Combo.DoesNotExist:
+                combo = combos_map.get(item["combo_id"])
+                if not combo:
                     return error_response(
                         "Invalid combo id",
                         400,
-                        {"item_index": idx, "combo": str(combo_id)},
+                        {"item_index": item["item_index"], "combo": item["combo_id"]},
                     )
                 base_price = combo.price
                 gst_percent = combo.gst_percent or Decimal("0.00")
@@ -552,26 +589,25 @@ class AddOrderItemsView(APIView):
             gst_amount = (base_price * gst_percent) / 100
             final_price = base_price + gst_amount
 
-            OrderItem.objects.create(
-                order=order,
-                product=product,
-                combo=combo,
-                quantity=qty,
-
-                base_price=base_price,
-                gst_percent=gst_percent,
-                gst_amount=gst_amount,
-
-                price_at_time=final_price
+            order_items_to_create.append(
+                OrderItem(
+                    order=order,
+                    product=product,
+                    combo=combo,
+                    quantity=item["quantity"],
+                    base_price=base_price,
+                    gst_percent=gst_percent,
+                    gst_amount=gst_amount,
+                    price_at_time=final_price,
+                )
             )
+            total += final_price * item["quantity"]
 
-            # ✅ ADD THIS INSIDE LOOP
-            total += final_price * qty
+        if order_items_to_create:
+            OrderItem.objects.bulk_create(order_items_to_create)
 
-
-        # ✅ AFTER LOOP
         order.total_amount = total
-        order.save()
+        order.save(update_fields=["total_amount"])
 
         return Response(
             {
@@ -703,7 +739,6 @@ class OrderListView(generics.ListAPIView):
         qs = (
             Order.objects
             .select_related("table", "customer")
-            .prefetch_related("items")
             .annotate(items_count=Count("items"))
             .order_by("-created_at")
         )
@@ -726,7 +761,6 @@ class RecentOrderListView(APIView):
         qs = (
             Order.objects
             .select_related("table", "customer")
-            .prefetch_related("items")
             .annotate(items_count=Count("items"))
             .order_by("-created_at")
         )
@@ -749,7 +783,7 @@ class RecentOrderListView(APIView):
                 "bill_number": format_bill_number(order.bill_number),
                 "customer_name": customer_name,
                 "table_name": order.table.number if order.table else None,
-                "items_count": order.items.count(),
+                "items_count": order.items_count,
                 "total_amount": order.total_amount,
                 "order_type": order.order_type,
                 "status": order.status,
@@ -767,7 +801,11 @@ class SendWhatsAppInvoiceView(APIView):
     def post(self, request, pk):
 
         try:
-            order = Order.objects.get(pk=pk)
+            order = (
+                Order.objects
+                .prefetch_related("items")
+                .get(pk=pk)
+            )
         except Order.DoesNotExist:
             return Response(
                 {"error": "Order not found"},
@@ -788,10 +826,16 @@ class SendWhatsAppInvoiceView(APIView):
             )
 
         # Get invoice data
-        subtotal = Decimal("0.00")
-
-        for item in order.items.all():
-            subtotal += item.price_at_time * item.quantity
+        subtotal = (
+            order.items.aggregate(
+                total=Coalesce(
+                    Sum(F("price_at_time") * F("quantity"), output_field=DecimalField(max_digits=12, decimal_places=2)),
+                    Decimal("0.00"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                )
+            )["total"]
+            or Decimal("0.00")
+        )
 
         final_amount = order.total_amount
 
@@ -829,3 +873,4 @@ class OrderDetailView(generics.RetrieveAPIView):
     serializer_class = OrderDetailSerializer
 
     permission_classes = [IsAdminOrStaff]
+

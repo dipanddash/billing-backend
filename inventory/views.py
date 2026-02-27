@@ -2,7 +2,7 @@ from rest_framework import generics
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from django.db.models import DecimalField, F, Sum
+from django.db.models import DecimalField, F, Sum, Value
 from django.db.models.functions import Coalesce
 from decimal import Decimal
 from django.utils import timezone
@@ -82,28 +82,26 @@ class VendorHistoryView(APIView):
         invoices = (
             PurchaseInvoice.objects
             .filter(vendor=vendor)
+            .annotate(
+                total_amount=Coalesce(
+                    Sum(
+                        F("items__quantity") * F("items__unit_price"),
+                        output_field=DecimalField(max_digits=12, decimal_places=2)
+                    ),
+                    Value(Decimal("0.00")),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                )
+            )
             .order_by("-created_at")
         )
 
         invoice_rows = []
         for inv in invoices:
-            total_amount = (
-                inv.items.aggregate(
-                    total=Coalesce(
-                        Sum(
-                            F("quantity") * F("unit_price"),
-                            output_field=DecimalField(max_digits=12, decimal_places=2)
-                        ),
-                        Decimal("0.00"),
-                        output_field=DecimalField(max_digits=12, decimal_places=2)
-                    )
-                )["total"]
-            )
             invoice_rows.append({
                 "id": str(inv.id),
                 "invoice_number": inv.invoice_number,
                 "date": inv.created_at.date().isoformat(),
-                "total_amount": total_amount,
+                "total_amount": inv.total_amount,
             })
 
         lifetime_spend = (

@@ -85,8 +85,8 @@ class ComboSerializer(serializers.ModelSerializer):
         return None
 
     def get_items(self, obj):
-        combo_items = obj.items.select_related("product").all()
-        return ComboItemSerializer(combo_items, many=True).data
+        combo_items = obj.items.all()
+        return ComboItemSerializer(combo_items, many=True, context=self.context).data
 
 
 class ComboItemSerializer(serializers.ModelSerializer):
