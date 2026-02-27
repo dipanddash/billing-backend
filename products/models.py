@@ -42,7 +42,7 @@ class Product(models.Model):
         blank=True
     )
 
-    is_active = models.BooleanField(default=True)
+    is_active = models.BooleanField(default=True, db_index=True)
 
     def save(self, *args, **kwargs):
         self.name = self.name.upper()
@@ -114,18 +114,27 @@ class Combo(models.Model):
         decimal_places=2
     )
 
+    gst_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=0.00
+    )
+
     image = models.ImageField(
         upload_to="combos/",
         null=True,
         blank=True
     )
 
-    is_active = models.BooleanField(default=True)
+    is_active = models.BooleanField(default=True, db_index=True)
 
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     class Meta:
         ordering = ["name"]
+        indexes = [
+            models.Index(fields=["is_active", "created_at"]),
+        ]
 
     def save(self, *args, **kwargs):
         self.name = self.name.upper()

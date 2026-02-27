@@ -4,13 +4,15 @@ from rest_framework.parsers import MultiPartParser, FormParser
 
 from accounts.permissions import IsAdminOrStaff, IsAdminRole
 
-from .models import Category, Product, Recipe, Addon, Combo
+from .models import Category, Product, Recipe, Addon, Combo, ComboItem
 from .serializers import (
     CategorySerializer,
     ProductSerializer,
     RecipeSerializer,
     AddonSerializer,
-    ComboSerializer
+    ComboSerializer,
+    ComboItemSerializer,
+    ComboWithItemsSerializer,
 )
 from rest_framework.parsers import JSONParser
 
@@ -47,7 +49,7 @@ class CategoryRetrieveUpdateDeleteView(generics.RetrieveUpdateDestroyAPIView):
 
 class ProductListCreateView(generics.ListCreateAPIView):
 
-    queryset = Product.objects.filter(is_active=True)
+    queryset = Product.objects.filter(is_active=True).select_related("category")
     serializer_class = ProductSerializer
     parser_classes = [MultiPartParser, FormParser]
 
@@ -88,12 +90,61 @@ class AddonListCreateView(generics.ListCreateAPIView):
 
 class ComboListCreateView(generics.ListCreateAPIView):
 
-    queryset = Combo.objects.filter(is_active=True)
-    serializer_class = ComboSerializer
-    parser_classes = [MultiPartParser, FormParser]
+    queryset = Combo.objects.filter(is_active=True).prefetch_related("items__product")
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get_permissions(self):
         if self.request.method == "POST":
+            return [IsAdminRole()]
+        return [IsAuthenticated()]
+
+    def get_serializer_class(self):
+        if self.request.method == "POST":
+            return ComboWithItemsSerializer
+        return ComboSerializer
+
+class ComboRetrieveUpdateDeleteView(generics.RetrieveUpdateDestroyAPIView):
+
+    queryset = Combo.objects.all().prefetch_related("items__product")
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def get_permissions(self):
+        if self.request.method in ["PUT", "PATCH", "DELETE"]:
+            return [IsAdminRole()]
+        return [IsAuthenticated()]
+
+    def get_serializer_class(self):
+        if self.request.method in ["PUT", "PATCH"]:
+            return ComboWithItemsSerializer
+        return ComboSerializer
+
+
+class ComboItemListCreateView(generics.ListCreateAPIView):
+
+    serializer_class = ComboItemSerializer
+    parser_classes = [JSONParser]
+
+    def get_queryset(self):
+        queryset = ComboItem.objects.select_related("combo", "product").all()
+        combo_id = self.request.query_params.get("combo")
+        if combo_id:
+            queryset = queryset.filter(combo_id=combo_id)
+        return queryset
+
+    def get_permissions(self):
+        if self.request.method == "POST":
+            return [IsAdminRole()]
+        return [IsAuthenticated()]
+
+
+class ComboItemRetrieveUpdateDeleteView(generics.RetrieveUpdateDestroyAPIView):
+
+    queryset = ComboItem.objects.select_related("combo", "product").all()
+    serializer_class = ComboItemSerializer
+    parser_classes = [JSONParser]
+
+    def get_permissions(self):
+        if self.request.method in ["PUT", "PATCH", "DELETE"]:
             return [IsAdminRole()]
         return [IsAuthenticated()]
 

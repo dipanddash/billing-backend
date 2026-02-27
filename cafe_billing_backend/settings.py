@@ -167,10 +167,4 @@ SIMPLE_JWT = {
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
-# ================================
-# TWILIO WHATSAPP SETTINGS
-# ================================
 
-TWILIO_ACCOUNT_SID = "YOUR_ACCOUNT_SID"
-TWILIO_AUTH_TOKEN = "YOUR_AUTH_TOKEN"
-TWILIO_WHATSAPP_FROM = "whatsapp:+14155238886"

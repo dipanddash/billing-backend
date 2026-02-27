@@ -196,7 +196,7 @@ class TopDishesReportView(APIView):
 
 
 class PaymentMethodReportView(APIView):
-    permission_classes = [IsAdminRole]
+    permission_classes = [IsAdminOrStaff]
 
     def get(self, request):
         start = _as_date(request.GET.get("start"))

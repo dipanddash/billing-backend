@@ -4,6 +4,10 @@ from .views import (
     CategoryRetrieveUpdateDeleteView,
     ProductListCreateView,
     ProductUpdateView,
+    ComboListCreateView,
+    ComboRetrieveUpdateDeleteView,
+    ComboItemListCreateView,
+    ComboItemRetrieveUpdateDeleteView,
     RecipeListCreateView,
     RecipeUpdateDeleteView,
 )
@@ -21,8 +25,12 @@ urlpatterns = [
         name="category-detail"
     ),
     path("products/", ProductListCreateView.as_view()),
+    path("combos/", ComboListCreateView.as_view()),
+    path("combo-items/", ComboItemListCreateView.as_view()),
     path("recipes/", RecipeListCreateView.as_view()),
     path("products/<uuid:pk>/", ProductUpdateView.as_view()),
+    path("combos/<uuid:pk>/", ComboRetrieveUpdateDeleteView.as_view()),
+    path("combo-items/<uuid:pk>/", ComboItemRetrieveUpdateDeleteView.as_view()),
     path("recipes/<int:pk>/", RecipeUpdateDeleteView.as_view()),
 
 ]

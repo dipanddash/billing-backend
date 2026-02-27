@@ -1,7 +1,9 @@
 from decimal import Decimal
+from datetime import datetime, timedelta
 from itertools import product
 
 from django.db import transaction
+from django.db.models import Count
 from django.utils import timezone
 
 from rest_framework import generics, status
@@ -13,7 +15,7 @@ from accounts.models import Customer
 from accounts.permissions import IsAdminOrStaff, IsAdminRole
 from payments.models import Payment
 from inventory.models import StockLog
-from products.models import Product, Recipe
+from products.models import Product, Recipe, Combo
 from tables.models import TableSession
 
 from .models import Order, OrderItem
@@ -24,7 +26,7 @@ from .serializers import (
     OrderListSerializer,
     OrderDetailSerializer
 )
-from .utils import send_whatsapp_invoice
+from .utils import send_whatsapp_invoice, format_order_id, format_bill_number
 
 
 def apply_order_filters(request, queryset):
@@ -87,13 +89,15 @@ class TodayOrderListView(generics.ListAPIView):
 
     def get_queryset(self):
 
-        today = timezone.now().date()
+        today = timezone.localdate()
+        start = timezone.make_aware(datetime.combine(today, datetime.min.time()))
+        end = start + timedelta(days=1)
 
         qs = (
             Order.objects
-            .filter(created_at__date=today)
+            .filter(created_at__gte=start, created_at__lt=end)
             .select_related("table", "session", "customer")
-            .prefetch_related("items__product")
+            .prefetch_related("items__product", "items__combo")
             .order_by("created_at")
         )
 
@@ -280,12 +284,15 @@ class OrderPaymentView(APIView):
             next_number = 1
             for prev_order in last_order:
                 try:
-                    next_number = int(prev_order.bill_number) + 1
+                    digits = "".join(ch for ch in str(prev_order.bill_number) if ch.isdigit())
+                    if not digits:
+                        continue
+                    next_number = int(digits) + 1
                     break
                 except (TypeError, ValueError):
                     continue
 
-            bill_no = f"{next_number:04d}"
+            bill_no = format_bill_number(next_number)
 
             # -------------------------
             # Update Order
@@ -330,6 +337,35 @@ class OrderPaymentView(APIView):
                             reason="SALE",
                             user=log_user
                         )
+                elif item.combo:
+                    combo_products = item.combo.items.select_related("product").all()
+                    for combo_product in combo_products:
+                        recipes = Recipe.objects.filter(product=combo_product.product)
+
+                        if not recipes.exists():
+                            raise ValidationError(
+                                f"No recipe for {combo_product.product.name}"
+                            )
+
+                        combined_qty = combo_product.quantity * item.quantity
+                        for recipe in recipes:
+                            used_qty = recipe.quantity * combined_qty
+                            ingredient = recipe.ingredient
+
+                            if ingredient.current_stock < used_qty:
+                                raise ValidationError(
+                                    f"Not enough stock for {ingredient.name}"
+                                )
+
+                            ingredient.current_stock -= used_qty
+                            ingredient.save()
+
+                            StockLog.objects.create(
+                                ingredient=ingredient,
+                                change=-used_qty,
+                                reason="SALE",
+                                user=log_user
+                            )
 
             # -------------------------
             # Close Session + Free Table
@@ -392,7 +428,7 @@ class OrderInvoiceView(APIView):
             grand_total += line_total
 
             items_data.append({
-                "name": item.product.name if item.product else "",
+                "name": item.product.name if item.product else (item.combo.name if item.combo else ""),
                 "quantity": item.quantity,
 
                 "base_price": item.base_price,
@@ -405,7 +441,7 @@ class OrderInvoiceView(APIView):
 
         return Response({
 
-            "bill_number": order.bill_number,
+            "bill_number": format_bill_number(order.bill_number),
             "date": order.created_at,
 
             "order_type": order.order_type,
@@ -458,9 +494,17 @@ class AddOrderItemsView(APIView):
         for idx, item in enumerate(items):
 
             product_id = item.get("product")
-            if not product_id:
+            combo_id = item.get("combo")
+
+            if not product_id and not combo_id:
                 return error_response(
-                    "Product id is required",
+                    "Product id or combo id is required",
+                    400,
+                    {"item_index": idx},
+                )
+            if product_id and combo_id:
+                return error_response(
+                    "Provide either product id or combo id, not both",
                     400,
                     {"item_index": idx},
                 )
@@ -480,17 +524,30 @@ class AddOrderItemsView(APIView):
                     {"item_index": idx},
                 )
 
-            try:
-                product = Product.objects.get(id=product_id)
-            except Product.DoesNotExist:
-                return error_response(
-                    "Invalid product id",
-                    400,
-                    {"item_index": idx, "product": str(product_id)},
-                )
-
-            base_price = product.price
-            gst_percent = product.gst_percent or Decimal("0.00")
+            product = None
+            combo = None
+            if product_id:
+                try:
+                    product = Product.objects.get(id=product_id)
+                except Product.DoesNotExist:
+                    return error_response(
+                        "Invalid product id",
+                        400,
+                        {"item_index": idx, "product": str(product_id)},
+                    )
+                base_price = product.price
+                gst_percent = product.gst_percent or Decimal("0.00")
+            else:
+                try:
+                    combo = Combo.objects.get(id=combo_id)
+                except Combo.DoesNotExist:
+                    return error_response(
+                        "Invalid combo id",
+                        400,
+                        {"item_index": idx, "combo": str(combo_id)},
+                    )
+                base_price = combo.price
+                gst_percent = combo.gst_percent or Decimal("0.00")
 
             gst_amount = (base_price * gst_percent) / 100
             final_price = base_price + gst_amount
@@ -498,6 +555,7 @@ class AddOrderItemsView(APIView):
             OrderItem.objects.create(
                 order=order,
                 product=product,
+                combo=combo,
                 quantity=qty,
 
                 base_price=base_price,
@@ -630,7 +688,7 @@ class OrderCreateView(APIView):
         return Response(
             {
                 "id": order.id,
-                "order_id": f"{order.order_number:03d}" if order.order_number is not None else None
+                "order_id": format_order_id(order.order_number)
             },
             status=201
         )
@@ -646,6 +704,7 @@ class OrderListView(generics.ListAPIView):
             Order.objects
             .select_related("table", "customer")
             .prefetch_related("items")
+            .annotate(items_count=Count("items"))
             .order_by("-created_at")
         )
         return apply_order_filters(self.request, qs)
@@ -668,6 +727,7 @@ class RecentOrderListView(APIView):
             Order.objects
             .select_related("table", "customer")
             .prefetch_related("items")
+            .annotate(items_count=Count("items"))
             .order_by("-created_at")
         )
 
@@ -685,8 +745,8 @@ class RecentOrderListView(APIView):
 
             data.append({
                 "id": str(order.id),
-                "order_id": f"{order.order_number:03d}" if order.order_number is not None else None,
-                "bill_number": order.bill_number,
+                "order_id": format_order_id(order.order_number),
+                "bill_number": format_bill_number(order.bill_number),
                 "customer_name": customer_name,
                 "table_name": order.table.number if order.table else None,
                 "items_count": order.items.count(),
@@ -736,7 +796,7 @@ class SendWhatsAppInvoiceView(APIView):
         final_amount = order.total_amount
 
         invoice_data = {
-            "bill": order.bill_number,
+            "bill": format_bill_number(order.bill_number),
             "customer": order.customer_name,
             "total": final_amount,
         }

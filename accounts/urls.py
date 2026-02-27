@@ -14,6 +14,8 @@ from .views import (
     StaffUserListCreateView,
     StaffUserDetailView,
     StaffUserStatusView,
+    AdminUserListCreateView,
+    AdminUserDetailView,
 )
 
 
@@ -32,5 +34,6 @@ urlpatterns = [
     path("staff/", StaffUserListCreateView.as_view(), name="staff-list-create"),
     path("staff/<uuid:pk>/", StaffUserDetailView.as_view(), name="staff-detail"),
     path("staff/<uuid:pk>/status/", StaffUserStatusView.as_view(), name="staff-status"),
+    path("admins/", AdminUserListCreateView.as_view(), name="admin-list-create"),
+    path("admins/<uuid:pk>/", AdminUserDetailView.as_view(), name="admin-detail"),
 ]
-

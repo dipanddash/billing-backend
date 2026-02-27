@@ -14,6 +14,7 @@ from .serializers import (
     CustomerSerializer,
     CustomTokenObtainPairSerializer,
     StaffUserSerializer,
+    AdminUserSerializer,
     MeProfileSerializer,
 )
 from .permissions import IsAdminRole
@@ -223,3 +224,25 @@ class StaffUserStatusView(APIView):
             },
             status=200
         )
+
+
+class AdminUserListCreateView(generics.ListCreateAPIView):
+    permission_classes = [IsAdminRole]
+    serializer_class = AdminUserSerializer
+
+    def get_queryset(self):
+        return User.objects.filter(role="ADMIN").order_by("username")
+
+    def perform_create(self, serializer):
+        serializer.save(role="ADMIN")
+
+
+class AdminUserDetailView(generics.RetrieveUpdateDestroyAPIView):
+    permission_classes = [IsAdminRole]
+    serializer_class = AdminUserSerializer
+    queryset = User.objects.filter(role="ADMIN")
+
+    def perform_destroy(self, instance):
+        if instance.id == self.request.user.id:
+            raise ValidationError("You cannot delete your own account.")
+        instance.delete()

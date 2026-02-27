@@ -65,13 +65,15 @@ class Order(models.Model):
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,
-        default="NEW"
+        default="NEW",
+        db_index=True,
     )
 
     payment_status = models.CharField(
         max_length=10,
         choices=PAYMENT_STATUS,
-        default="UNPAID"
+        default="UNPAID",
+        db_index=True,
     )
 
     total_amount = models.DecimalField(
@@ -100,7 +102,8 @@ class Order(models.Model):
     bill_number = models.CharField(
         max_length=50,
         blank=True,
-        null=True
+        null=True,
+        db_index=True,
     )
     order_number = models.PositiveIntegerField(
         unique=True,
@@ -108,7 +111,14 @@ class Order(models.Model):
         blank=True
     )
 
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["created_at"]),
+            models.Index(fields=["status", "payment_status", "created_at"]),
+            models.Index(fields=["staff", "created_at"]),
+        ]
 
     def save(self, *args, **kwargs):
         if self.order_number is None:

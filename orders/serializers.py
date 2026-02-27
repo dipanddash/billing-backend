@@ -6,6 +6,7 @@ from django.db import transaction
 from .models import Order, OrderItem, OrderItemAddon
 from products.models import Product, Addon
 from accounts.models import Customer
+from .utils import format_order_id, format_bill_number
 
 
 # -------------------------------
@@ -321,9 +322,7 @@ class KitchenOrderSerializer(serializers.ModelSerializer):
         ]
 
     def get_order_id(self, obj):
-        if obj.order_number is not None:
-            return f"{obj.order_number:03d}"
-        return None
+        return format_order_id(obj.order_number)
 
     def get_customer_name(self, obj):
 
@@ -347,11 +346,9 @@ class OrderListSerializer(serializers.ModelSerializer):
 
     customer_name = serializers.SerializerMethodField()
 
-    items_count = serializers.IntegerField(
-        source="items.count",
-        read_only=True
-    )
+    items_count = serializers.IntegerField(read_only=True)
     order_id = serializers.SerializerMethodField()
+    bill_number = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
@@ -374,9 +371,10 @@ class OrderListSerializer(serializers.ModelSerializer):
         ]
 
     def get_order_id(self, obj):
-        if obj.order_number is not None:
-            return f"{obj.order_number:03d}"
-        return None
+        return format_order_id(obj.order_number)
+
+    def get_bill_number(self, obj):
+        return format_bill_number(obj.bill_number)
 
     def get_customer_name(self, obj):
         if obj.customer and obj.customer.name:
@@ -422,9 +420,7 @@ class OrderDetailSerializer(serializers.ModelSerializer):
         ]
 
     def get_order_id(self, obj):
-        if obj.order_number is not None:
-            return f"{obj.order_number:03d}"
-        return None
+        return format_order_id(obj.order_number)
 
     def get_session(self, obj):
         if obj.session_id:
