@@ -201,7 +201,7 @@ class OrderPaymentView(APIView):
 
     permission_classes = [IsAdminOrStaff]
 
-    def post(self, request, pk):
+    def post(self, request, pk): 
 
         method = request.data.get("method")
 
